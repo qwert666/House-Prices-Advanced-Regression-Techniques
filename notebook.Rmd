@@ -1,0 +1,206 @@
+---
+title: "Data exploration"
+output:
+  html_notebook: default
+  html_document: default
+---
+
+```{r, echo=FALSE}
+library(ggplot2)
+library(h2o)
+localH2O = h2o.init(nthreads=-1)
+library(DT)
+library(magrittr)
+```
+
+Loading data
+```{r}
+train <- read.csv("data/train.csv")
+test <- read.csv("data/test.csv")
+
+train.hex <- as.h2o(train)
+test.hex <- as.h2o(test)
+```
+
+#### Data describe
+```{r, echo = FALSE, results = 'asis'}
+datatable(h2o.describe(train.hex))
+```
+
+
+Manually changing types ( based on data_description )
+```{r}
+train.hex[, "Id"] <- NULL
+categoryFeatures <- c(
+  "MSSubClass",
+  "OverallQual", 
+  "OverallCond",
+  "YearBuilt",
+  "YearRemodAdd",
+  "BsmtFullBath",
+  "BsmtHalfBath",
+  "FullBath",
+  "HalfBath",
+  "BedroomAbvGr",
+  "KitchenAbvGr",
+  "KitchenQual",
+  "TotRmsAbvGrd",
+  "Fireplaces",
+  "GarageYrBlt",
+  "GarageCars",
+  "MoSold",
+  "YrSold")
+train.hex[, categoryFeatures] <- as.factor(train.hex[, categoryFeatures])
+test.hex[, categoryFeatures] <- as.factor(test.hex[, categoryFeatures])
+```
+
+Table indicate that there are a lot of missing data and noninformative zeros so i'm getting rid of them. I'm assuming that columns with less then 20% of data will not improve the model ( to check )
+
+```{r}
+withoutMissingColNames <- h2o.colnames(train.hex[, !as.numeric(
+  as.character(
+    h2o.describe(train.hex)$Missing
+  )
+) > (nrow(train.hex) * 0.8)])
+
+
+filteredColNames <- h2o.colnames(train.hex[, !as.numeric(
+  as.character(
+    h2o.describe(train.hex)$Zeros
+  )
+) > (nrow(train.hex) * 0.8), withoutMissingColNames])
+
+
+train.hex2 <- train.hex[, filteredColNames]
+test.hex2 <- test.hex[, setdiff(filteredColNames, "SalePrice")]
+ncol(train.hex2)
+```
+
+
+
+```{r}
+tmp <- h2o.group_by(train.hex2, 
+                        by = c("YrSold", "MoSold"), 
+                        nrow("SalePrice")) %>%
+  as.data.frame()
+
+ggplot(tmp, aes(MoSold, nrow_SalePrice)) +
+  geom_bar(aes(fill = YrSold), stat = "identity") + 
+  facet_grid(YrSold ~ .)
+```
+
+```{r}
+h2o.group_by(train.hex2, by = "YrSold", sum("SalePrice"))
+```
+
+Removing 2010 from the dataset
+
+```{r}
+train.hex3 <- train.hex2[train.hex2$YrSold != "2010", ]
+```
+
+#### Numeric type data
+
+Let's check the skewness 
+```{r}
+train.hex3[, h2o.columns_by_type(train.hex3, coltype = "numeric")] %>%
+  h2o.skewness()
+```
+
+Most of them are quite strongly skweed, lets try to apply a simple trick with log1p
+```{r}
+train.hex3[, h2o.columns_by_type(train.hex3, coltype = "numeric")] %>%
+  h2o.log1p() %>%
+  h2o.skewness() 
+```
+
+Did help but not to all of the colums, lets get the trouble ids
+```{r, message=FALSE, warning=FALSE}
+skewedTmp <- train.hex3[, h2o.columns_by_type(train.hex3, coltype = "numeric")] %>%
+  h2o.log1p() %>%
+  h2o.skewness() %>%
+  `if`(. > 0.5 | . > -0.5, TRUE, FALSE)
+
+banedColumns <- train.hex3[, h2o.columns_by_type(train.hex3, coltype = "numeric")[!skewedTmp]] %>%
+  h2o.colnames()
+
+banedColumns
+```
+
+And apply log1p on the rest 
+```{r}
+train.hex4 <- train.hex3[, h2o.columns_by_type(train.hex3, coltype = "numeric")] %>%
+  h2o.colnames() %>%
+  setdiff(., banedColumns) %>%
+  { h2o.log1p(train.hex3[, .]) }
+
+head(train.hex4)
+```
+
+
+Join with categorical data ( should do it by Id column that i removed )
+```{r}
+train.hex5 <- h2o.cbind(train.hex3[, h2o.columns_by_type(train.hex3, coltype = "categorical")], train.hex4)
+
+head(train.hex5, 5)
+```
+
+```{r}
+glm <- h2o.glm(y = "log1p(SalePrice)",
+                        x = setdiff(h2o.colnames(train.hex5), "log1p(SalePrice)"),
+                        training_frame = train.hex5, 
+                        nfolds = 5,
+                        fold_assignment = "Modulo",
+                        keep_cross_validation_predictions = TRUE,
+                        solver = "L_BFGS"
+                        )
+```
+```{r}
+gbm <- h2o.gbm(y = "log1p(SalePrice)", 
+        x = setdiff(h2o.colnames(train.hex5), "log1p(SalePrice)"),
+        training_frame = train.hex5,
+        ntrees = 200, 
+        max_depth = 1, learn_rate = 0.10, histogram_type = "UniformAdaptive",
+        stopping_metric = "RMSE", col_sample_rate_per_tree = 0.2,
+        col_sample_rate_change_per_level = 0.8,
+        nbins = 30,
+        fold_assignment = "Modulo",
+        keep_cross_validation_predictions = TRUE,
+        nfolds = 5)
+```
+
+```{r}
+rf <- h2o.randomForest(y = "log1p(SalePrice)", 
+                       x = setdiff(h2o.colnames(train.hex5), "log1p(SalePrice)"),
+                       training_frame = train.hex5,
+                       nfolds = 5,
+                       fold_assignment = "Modulo",
+                       max_depth = 10, ntrees = 10,
+                       keep_cross_validation_predictions = TRUE)
+```
+
+Getting the RMSE mean from CV
+```{r}
+glm@model$cross_validation_metrics_summary$mean[6]
+```
+```{r}
+gbm@model$cross_validation_metrics_summary$mean[6]
+```
+
+```{r}
+rf@model$cross_validation_metrics_summary$mean[6]
+```
+
+```{r}
+library(h2oEnsemble)
+models <- list(glm, gbm, rf)
+metalearner <- "h2o.glm.wrapper"
+
+stack <- h2o.stack(models = models,
+                   response_frame = train.hex5[, "log1p(SalePrice)"],
+                   seed = 1,
+                   metalearner = metalearner,
+                   keep_levelone_data = TRUE)
+
+h2o.predict(stack$metafit, test.hex3)
+```
